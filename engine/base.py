@@ -762,9 +762,9 @@ class BaseTrainer:
                 teacher=self.teacher,
                 device=self.device,
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
-                teacher_layer_names=['em_blocks.8.convs.4'],
-                student_layer_names=['model.6.m.1.cv2.bn'],
-                teacher_channels=[16],
+                teacher_layer_names=['fem_blocks.8'],
+                student_layer_names=['model.6.m.1.1.mlp.1.act'],
+                teacher_channels=[32],
                 student_channels=[128],
             )
 
@@ -847,17 +847,16 @@ class BaseTrainer:
                         # Distillation loss -----------------------------------
                         if distill_trainer is not None:
                             with torch.no_grad():
-                                # if distill_trainer._teacher_layer_names is not None:
-                                #     # Cross-architecture (IRFormer): resize về input size của teacher
-                                #     teacher_input = F.interpolate(
-                                #         batch["img"],
-                                #         size=(256, 256),
-                                #         mode="bilinear",
-                                #         align_corners=False,
-                                #     )
-                                # else:
-                                #     # YOLO-to-YOLO: dùng nguyên batch["img"]
-                                teacher_input = batch["img"]
+                                if distill_trainer._teacher_layer_names is not None:
+                                    teacher_input = F.interpolate(
+                                        batch["img"],
+                                        size=(256, 256),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                else:
+                                    # YOLO-to-YOLO: dùng nguyên batch["img"]
+                                    teacher_input = batch["img"]
                                 self.teacher(teacher_input)
 
                             d_loss = distill_trainer.get_loss() * self.kd_loss_weight
