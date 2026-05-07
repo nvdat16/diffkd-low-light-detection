@@ -267,9 +267,27 @@ class DistillationTrainer:
         self.student_logits.clear()
         self.teacher_logits.clear()
 
+        def _first_tensor(out):
+            if isinstance(out, torch.Tensor):
+                return out
+            if isinstance(out, (list, tuple)):
+                for item in out:
+                    feat = _first_tensor(item)
+                    if feat is not None:
+                        return feat
+            if isinstance(out, dict):
+                for item in out.values():
+                    feat = _first_tensor(item)
+                    if feat is not None:
+                        return feat
+            return None
+
         def _make_hook(storage, detach=False):
             def hook(m, inp, out):
-                feat = out.detach() if detach else out
+                feat = _first_tensor(out)
+                if feat is None:
+                    return
+                feat = feat.detach() if detach else feat
                 storage.append(feat)
             return hook
 
@@ -282,6 +300,57 @@ class DistillationTrainer:
         for h in self._handles:
             h.remove()
         self._handles.clear()
+
+
+class GLARETeacher(nn.Module):
+    """Wrapper to use GLARE as a frozen teacher inside DiffKD training."""
+
+    def __init__(self, conf_path, glare_root=None):
+        super().__init__()
+        import sys
+
+        conf_path = Path(conf_path).expanduser().resolve()
+        if glare_root is None:
+            glare_root = conf_path.parents[2]
+        glare_root = Path(glare_root).expanduser().resolve()
+        glare_code = glare_root / "code"
+        if str(glare_code) not in sys.path:
+            sys.path.insert(0, str(glare_code))
+
+        import options.options as option
+        from models import create_model
+        from utils.util import opt_get
+
+        cwd = os.getcwd()
+        os.chdir(glare_root)
+        try:
+            opt = option.parse(str(conf_path), is_train=False)
+            opt["gpu_ids"] = None
+            opt = option.dict_to_nonedict(opt)
+            self.glare = create_model(opt)
+
+            model_path = opt_get(opt, ["model_path"], None)
+            if model_path is not None:
+                self.glare.load_network(load_path=model_path, network=self.glare.netG)
+        finally:
+            os.chdir(cwd)
+
+        self.opt = opt
+        self.netG = self.glare.netG
+        self.net_hq = self.glare.net_hq
+
+    def forward(self, x):
+        if next(self.netG.parameters()).device != x.device:
+            self.glare.netG = self.glare.netG.to(x.device)
+            self.glare.net_hq = self.glare.net_hq.to(x.device)
+            self.netG = self.glare.netG
+            self.net_hq = self.glare.net_hq
+
+        with torch.cuda.amp.autocast(enabled=x.is_cuda):
+            if self.opt["datasets"]["train"].get("log_low", False):
+                x = torch.log(torch.clamp(x + 1e-3, min=1e-3))
+            sr, _ = self.glare.get_sr_with_z(x, heat=0)
+        return sr
 
 
 class BaseTrainer:
@@ -641,42 +710,48 @@ class BaseTrainer:
             # Lazy-load: DDP worker ranks arrive here without a live teacher object
             if self.teacher is None:
                 LOGGER.info(f"{colorstr('Distillation:')} loading teacher from '{self.teacher_path}'")
-                ckpt = torch.load(self.teacher_path, map_location="cpu", weights_only=False)
-                # Handle both checkpoint dict {"model": ...} and raw .pt files
-                if isinstance(ckpt, dict):
-                    if "model" in ckpt or "ema" in ckpt:
-                        # YOLO-style checkpoint
-                        self.teacher = ckpt.get("model") or ckpt.get("ema")
-                    elif "state_dict" in ckpt:
-                        # IRFormer / generic PyTorch checkpoint → khởi tạo model rồi load weights
-                        _m = self.build_teacher_model()
-                        _m.load_state_dict(ckpt["state_dict"], strict=True)
-                        self.teacher = _m
-                        LOGGER.info(
-                            f"{colorstr('Distillation:')} loaded IRFormer via state_dict "
-                        )
-                    else:
-                        raise ValueError(
-                            f"Distillation: checkpoint '{self.teacher_path}' has no recognised key. "
-                            f"Available keys: {list(ckpt.keys())}"
-                        )
+                teacher_suffix = Path(self.teacher_path).suffix.lower()
+                if teacher_suffix in {".yml", ".yaml"}:
+                    self.teacher = GLARETeacher(self.teacher_path)
+                    LOGGER.info(f"{colorstr('Distillation:')} loaded GLARE teacher from config")
                 else:
-                    self.teacher = ckpt  # raw nn.Module saved directly
-                # Unwrap YOLO wrapper layers until we reach the bare DetectionModel
-                # (YOLO → .model → DetectionModel; DetectionModel → .model → nn.Sequential)
-                # We want DetectionModel so named_modules yields "model.6.cv2.*"
-                for _ in range(5):  # max 5 levels deep
-                    if hasattr(self.teacher, "model") and isinstance(self.teacher.model, torch.nn.Module):
-                        # Stop if current level already has "model.X.cv2" structure
-                        has_cv2 = any(
-                            "cv2" in n and n.split(".")[0] == "model"
-                            for n, _ in self.teacher.named_modules()
-                        )
-                        if has_cv2:
-                            break
-                        self.teacher = self.teacher.model
+                    ckpt = torch.load(self.teacher_path, map_location="cpu", weights_only=False)
+                    # Handle both checkpoint dict {"model": ...} and raw .pt files
+                    if isinstance(ckpt, dict):
+                        if "model" in ckpt or "ema" in ckpt:
+                            # YOLO-style checkpoint
+                            self.teacher = ckpt.get("model") or ckpt.get("ema")
+                        elif "state_dict" in ckpt:
+                            # IRFormer / generic PyTorch checkpoint → khởi tạo model rồi load weights
+                            _m = self.build_teacher_model()
+                            _m.load_state_dict(ckpt["state_dict"], strict=True)
+                            self.teacher = _m
+                            LOGGER.info(
+                                f"{colorstr('Distillation:')} loaded teacher via state_dict "
+                            )
+                        else:
+                            raise ValueError(
+                                f"Distillation: checkpoint '{self.teacher_path}' has no recognised key. "
+                                f"Available keys: {list(ckpt.keys())}"
+                            )
                     else:
-                        break
+                        self.teacher = ckpt  # raw nn.Module saved directly
+
+                    # Unwrap YOLO wrapper layers until we reach the bare DetectionModel
+                    # (YOLO → .model → DetectionModel; DetectionModel → .model → nn.Sequential)
+                    # We want DetectionModel so named_modules yields "model.6.cv2.*"
+                    for _ in range(5):  # max 5 levels deep
+                        if hasattr(self.teacher, "model") and isinstance(self.teacher.model, torch.nn.Module):
+                            # Stop if current level already has "model.X.cv2" structure
+                            has_cv2 = any(
+                                "cv2" in n and n.split(".")[0] == "model"
+                                for n, _ in self.teacher.named_modules()
+                            )
+                            if has_cv2:
+                                break
+                            self.teacher = self.teacher.model
+                        else:
+                            break
 
             self.teacher = self.teacher.to(self.device).eval()
             for p in self.teacher.parameters():
@@ -687,7 +762,7 @@ class BaseTrainer:
                 teacher=self.teacher,
                 device=self.device,
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
-                teacher_layer_names=['transformer.2.ffn.project_out'],
+                teacher_layer_names=['em_blocks.8.convs.4'],
                 student_layer_names=['model.6.m.1.cv2.bn'],
                 teacher_channels=[16],
                 student_channels=[128],
@@ -772,17 +847,17 @@ class BaseTrainer:
                         # Distillation loss -----------------------------------
                         if distill_trainer is not None:
                             with torch.no_grad():
-                                if distill_trainer._teacher_layer_names is not None:
-                                    # Cross-architecture (IRFormer): resize về input size của teacher
-                                    teacher_input = F.interpolate(
-                                        batch["img"],
-                                        size=(256, 256),
-                                        mode="bilinear",
-                                        align_corners=False,
-                                    )
-                                else:
-                                    # YOLO-to-YOLO: dùng nguyên batch["img"]
-                                    teacher_input = batch["img"]
+                                # if distill_trainer._teacher_layer_names is not None:
+                                #     # Cross-architecture (IRFormer): resize về input size của teacher
+                                #     teacher_input = F.interpolate(
+                                #         batch["img"],
+                                #         size=(256, 256),
+                                #         mode="bilinear",
+                                #         align_corners=False,
+                                #     )
+                                # else:
+                                #     # YOLO-to-YOLO: dùng nguyên batch["img"]
+                                teacher_input = batch["img"]
                                 self.teacher(teacher_input)
 
                             d_loss = distill_trainer.get_loss() * self.kd_loss_weight

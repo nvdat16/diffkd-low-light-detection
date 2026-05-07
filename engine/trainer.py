@@ -27,8 +27,10 @@ class DetectionTrainer(BaseTrainer):
 
     def build_teacher_model(self):
         """Override để load IRFormer teacher từ state_dict."""
-        from models.irformer import Model as IRFormer
-        return IRFormer(in_nc=3, out_nc=3, base_nf=16)
+        # from models.irformer import Model as IRFormer
+        # return IRFormer(in_nc=3, out_nc=3, base_nf=16)
+        from models.mbllen import MBLLEN
+        return MBLLEN()
     
     def build_dataset(self, img_path, mode="train", batch=None):
         gs = max(int(unwrap_model(self.model).stride.max()), 32)
